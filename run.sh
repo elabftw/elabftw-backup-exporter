@@ -1,71 +1,90 @@
 #!/usr/bin/env bash
 # Restore a backup into disposable MySQL, export it, and remove both containers.
+# With --eln, convert an eLabFTW .eln export instead; no database is started.
 set -Eeuo pipefail
 
 usage() {
     cat <<'EOF'
 Usage: bash run.sh --sql dump.sql.gz --uploads uploads.tar.gz --output exported
+       bash run.sh --eln export.eln --output exported
 
-Required:
+Required (database backup):
   --sql FILE             A mysqldump .sql.gz or uncompressed .sql file
   --uploads FILE_OR_DIR  A .tar.gz/.tar archive, or an extracted uploads directory
+  --output DIRECTORY    New or empty destination directory
+
+Required (instead, for an eLabFTW .eln export):
+  --eln FILE             A .eln file exported by eLabFTW (one or many entries)
   --output DIRECTORY    New or empty destination directory
 
 Options:
   --mysql-image IMAGE   Default: mysql:8.4 (use mysql:8.0 for older dumps if needed)
   --database NAME       Import/export a specific database; otherwise auto-detect
   --exclude-deleted     Skip soft-deleted entities and attachments (state = 3)
-  --include-templates   Also export experiment and resource templates
+  --include-templates   Also export experiment and resource templates (database mode;
+                        templates present in a .eln are always exported)
   --no-pdf              Only produce HTML, JSON, and attachments
   --pdf-timeout SECONDS Default: 90 per PDF; files are retained if rendering fails
   --help                Show this help
 
-Requires Docker, Bash, gzip, and enough disk for MySQL + unpacked uploads + export.
+Requires Docker, Bash, gzip, and enough disk for MySQL + unpacked uploads + export
+(or, with --eln, for the exported files only).
 EOF
 }
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 need_value() { [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value"; }
 sql_file=''
+eln_file=''
 uploads_path=''
 output_path=''
 mysql_image='mysql:8.4'
 database=''
+mysql_option=''
 extra_args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --sql) need_value "$@"; sql_file=$2; shift 2 ;;
         --uploads) need_value "$@"; uploads_path=$2; shift 2 ;;
+        --eln) need_value "$@"; eln_file=$2; shift 2 ;;
         --output) need_value "$@"; output_path=$2; shift 2 ;;
-        --mysql-image) need_value "$@"; mysql_image=$2; shift 2 ;;
-        --database) need_value "$@"; database=$2; shift 2 ;;
+        --mysql-image) need_value "$@"; mysql_image=$2; mysql_option=$1; shift 2 ;;
+        --database) need_value "$@"; database=$2; mysql_option=$1; shift 2 ;;
         --pdf-timeout) need_value "$@"; [[ $2 =~ ^[1-9][0-9]*$ ]] || die '--pdf-timeout must be a positive integer'; extra_args+=("$1" "$2"); shift 2 ;;
         --exclude-deleted|--include-templates|--no-pdf) extra_args+=("$1"); shift ;;
         --help|-h) usage; exit 0 ;;
         *) die "Unknown argument: $1" ;;
     esac
 done
-[[ -n $sql_file && -n $uploads_path && -n $output_path ]] || { usage >&2; exit 1; }
+if [[ -n $eln_file ]]; then
+    [[ -z $sql_file && -z $uploads_path ]] || die '--eln cannot be combined with --sql/--uploads'
+    [[ -z $mysql_option ]] || die "$mysql_option only applies to --sql backups"
+    [[ -n $output_path ]] || { usage >&2; exit 1; }
+    [[ -f $eln_file && -r $eln_file ]] || die "Cannot read .eln file: $eln_file"
+else
+    [[ -n $sql_file && -n $uploads_path && -n $output_path ]] || { usage >&2; exit 1; }
+    [[ -f $sql_file && -r $sql_file ]] || die "Cannot read SQL dump: $sql_file"
+    [[ -r $uploads_path && ( -f $uploads_path || -d $uploads_path ) ]] || die "Cannot read uploads: $uploads_path"
+fi
 [[ -z $database || $database =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$ ]] || die 'Invalid database name'
-[[ -f $sql_file && -r $sql_file ]] || die "Cannot read SQL dump: $sql_file"
-[[ -r $uploads_path && ( -f $uploads_path || -d $uploads_path ) ]] || die "Cannot read uploads: $uploads_path"
 for tool in docker gzip od tr mktemp; do command -v "$tool" >/dev/null || die "Missing command: $tool"; done
 docker info >/dev/null 2>&1 || die 'Docker is not running or this user cannot access it'
 
 # Resolve paths using Bash so no host Python or realpath is required.
 absolute_file() { (cd -- "$(dirname -- "$1")" && printf '%s/%s\n' "$PWD" "$(basename -- "$1")"); }
-sql_file=$(absolute_file "$sql_file")
-if [[ -d $uploads_path ]]; then uploads_path=$(cd -- "$uploads_path" && pwd -P); else uploads_path=$(absolute_file "$uploads_path"); fi
+if [[ -n $eln_file ]]; then eln_file=$(absolute_file "$eln_file"); fi
+if [[ -n $sql_file ]]; then sql_file=$(absolute_file "$sql_file"); fi
+if [[ -d $uploads_path ]]; then uploads_path=$(cd -- "$uploads_path" && pwd -P); elif [[ -n $uploads_path ]]; then uploads_path=$(absolute_file "$uploads_path"); fi
 mkdir -p -- "$output_path"
 output_path=$(cd -- "$output_path" && pwd -P)
-if [[ -d $uploads_path && ( $output_path == "$uploads_path" || $output_path == "$uploads_path/"* ) ]]; then die 'Output must be outside the uploads source directory'; fi
+if [[ -n $uploads_path && -d $uploads_path && ( $output_path == "$uploads_path" || $output_path == "$uploads_path/"* ) ]]; then die 'Output must be outside the uploads source directory'; fi
 [[ -w $output_path ]] || die "Output directory is not writable: $output_path"
 shopt -s nullglob dotglob
 existing=("$output_path"/*)
 [[ ${#existing[@]} -eq 0 ]] || die 'The output directory must be empty (existing files are never overwritten)'
 shopt -u nullglob dotglob
 # Docker's --mount syntax cannot express comma-containing source paths.
-[[ $uploads_path != *,* && $output_path != *,* ]] || die 'Uploads/output paths cannot contain a comma'
+[[ $uploads_path != *,* && $eln_file != *,* && $output_path != *,* ]] || die 'Uploads/.eln/output paths cannot contain a comma'
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 token=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
 db_container="elab-export-db-$token"
@@ -85,6 +104,33 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+report_result() {
+    if [[ $1 -eq 0 ]]; then
+        printf '\nExport complete: %s\nOpen index.html to browse it.\n' "$output_path"
+    elif [[ $1 -eq 2 ]]; then
+        printf '\nExport finished with missing files or PDF errors. See %s/export-report.json\n' "$output_path" >&2
+    else
+        printf '\nExport failed. Any recovered files remain in %s\n' "$output_path" >&2
+    fi
+}
+
+if [[ -n $eln_file ]]; then
+    printf 'Building the exporter image...\n'
+    docker build -t elabftw-backup-exporter:local "$script_dir"
+    printf 'Exporting records and attachments from the .eln file...\n'
+    # No database and no network are needed: the archive is read directly.
+    set +e
+    docker run --name "$worker_container" --network none \
+        --user "$(id -u):$(id -g)" \
+        --mount "type=bind,source=$eln_file,target=/input/export.eln,readonly" \
+        --mount "type=bind,source=$output_path,target=/output" \
+        elabftw-backup-exporter:local --eln /input/export.eln --output /output "${extra_args[@]}"
+    result=$?
+    set -e
+    report_result "$result"
+    exit "$result"
+fi
 password=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
 import_database=${database:-elabftw}
 umask 077
@@ -128,11 +174,5 @@ docker run --name "$worker_container" --network "$network" \
     elabftw-backup-exporter:local --uploads /input/uploads --output /output "${extra_args[@]}"
 result=$?
 set -e
-if [[ $result -eq 0 ]]; then
-    printf '\nExport complete: %s\nOpen index.html to browse it.\n' "$output_path"
-elif [[ $result -eq 2 ]]; then
-    printf '\nExport finished with missing files or PDF errors. See %s/export-report.json\n' "$output_path" >&2
-else
-    printf '\nExport failed. Any recovered files remain in %s\n' "$output_path" >&2
-fi
+report_result "$result"
 exit "$result"
