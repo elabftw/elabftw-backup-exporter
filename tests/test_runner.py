@@ -21,7 +21,7 @@ if args[0]=='run' and '-d' not in args:sys.exit(int(os.environ.get('DOCKER_TEST_
 
 
 class RunnerTests(unittest.TestCase):
-    def run_launcher(self, import_code=0, export_code=0):
+    def run_launcher(self, import_code=0, export_code=0, inputs=None):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name)
@@ -35,10 +35,11 @@ class RunnerTests(unittest.TestCase):
                    DOCKER_TEST_SQL=str(restored), DOCKER_TEST_IMPORT_CODE=str(import_code),
                    DOCKER_TEST_EXPORT_CODE=str(export_code))
         package = Path(__file__).resolve().parents[1]
-        command = ['bash',str(package/'run.sh'),'--sql',str(package/'demo/demo.sql.gz'),
-                   '--uploads',str(package/'demo/demo-uploads.tar.gz'),'--output',str(root/'output with spaces')]
+        if inputs is None:
+            inputs = ['--sql',str(package/'demo/demo.sql.gz'),'--uploads',str(package/'demo/demo-uploads.tar.gz')]
+        command = ['bash',str(package/'run.sh'),*inputs,'--output',str(root/'output with spaces')]
         result = subprocess.run(command, env=env, capture_output=True, text=True)
-        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         return result, calls, restored
 
     def test_imports_gzip_and_cleans_up_without_publishing_ports(self):
@@ -66,6 +67,27 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('export-report.json', result.stderr)
         self.assertTrue(any(call[:2]==['rm','-fv'] for call in calls))
+
+
+    def test_eln_export_needs_no_database_or_network(self):
+        demo = Path(__file__).resolve().parents[1]/'demo/demo.eln'
+        result, calls, restored = self.run_launcher(export_code=2, inputs=['--eln',str(demo),'--no-pdf'])
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(restored.exists())
+        self.assertFalse(any(call[0]=='run' and '-d' in call for call in calls))
+        self.assertFalse(any(call[:2]==['network','create'] for call in calls))
+        worker = next(call for call in calls if call[0]=='run')
+        self.assertEqual(worker[worker.index('--network')+1], 'none')
+        self.assertTrue(any('target=/input/export.eln,readonly' in part for part in worker))
+        self.assertEqual(worker[-5:], ['--eln','/input/export.eln','--output','/output','--no-pdf'])
+        self.assertTrue(any(call[:2]==['rm','-fv'] for call in calls))
+
+    def test_eln_rejects_database_options(self):
+        demo = Path(__file__).resolve().parents[1]/'demo/demo.eln'
+        result, calls, _ = self.run_launcher(inputs=['--eln',str(demo),'--database','elabftw'])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('only applies to --sql', result.stderr)
+        self.assertEqual(calls, [])
 
 
 if __name__=='__main__':

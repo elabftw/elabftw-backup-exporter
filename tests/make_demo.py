@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Generate a tiny, entirely synthetic SQL/uploads backup for a smoke test."""
+"""Generate a tiny, entirely synthetic SQL/uploads backup and .eln export for a smoke test."""
 import argparse
 import gzip
+import hashlib
 import io
 import json
 from pathlib import Path
 import struct
 import tarfile
+import zipfile
 import zlib
 
 
@@ -98,6 +100,75 @@ def make_fixture(destination, with_missing=False):
     return dump_path, uploads_path
 
 
+def make_eln(path, extra_members=(), publisher="eLabFTW", with_missing=False):
+    """Write a synthetic .eln laid out like recent eLabFTW exports (UUID folders and file names)."""
+    root = "2026-10-08-120000-export"
+    alice = "person://alice?hash_algo=sha256"
+    files = {
+        "./e1/f1": ("Microscopy image.png", "ab/abcdef01.png", png_image(), "Normal", "Inline image"),
+        "./e1/f2": ("notes.txt", "cd/cdef0002.txt", b"First set of notes.\n", "Normal", None),
+        "./e1/f3": ("notes.txt", "de/de000003.txt", b"Second set of notes.\n", "Archived", None),
+        "./r1/f4": ("Measurements.csv", "ef/ef000004.csv", b"sample,value\nA,12.5\n", "Normal", None),
+        "./r1/f5": ("record.html", "fa/fa000005.html", b"<p>Collides with record.html.</p>", "Normal", None),
+        "./t1/f6": ("Template instructions.txt", "dd/dd000010.txt", b"Template instructions.\n", "Normal", None),
+        "./d1/f7": ("deleted experiment.txt", "aa/aa000007.txt", b"Deleted experiment file.\n", "Normal", None),
+    }
+    if with_missing:
+        files["./e1/f8"] = ("missing.txt", "ff/ff000012.txt", None, "Normal", None)
+    graph = [
+        {"@id": "ro-crate-metadata.json", "@type": "CreativeWork", "about": {"@id": "./"}, "sdPublisher": {"@id": "#publisher"}},
+        {"@id": "#publisher", "@type": "Organization", "name": publisher, "areaServed": "Laniakea Supercluster"},
+        {"@id": "./", "@type": "Dataset", "version": "109", "hasPart": [{"@id": f"./{key}/"} for key in ("e1", "e2", "r1", "t1", "d1", "e3")]},
+        {"@id": alice, "@type": "Person", "givenName": "Alice", "familyName": "Smith", "email": "alice@example.invalid"},
+        {"@id": "person://renee?hash_algo=sha256", "@type": "Person", "givenName": "Renée", "familyName": "Martin"},
+        {"@id": "person://alice2?hash_algo=sha256", "@type": "Person", "givenName": "Alice", "familyName": "Smith", "email": "other@example.invalid"},
+        {"@id": "#category-Demo", "@type": "Thing", "name": "Demo project", "color": "29AEB9"},
+        {"@id": "comment://1", "@type": "Comment", "dateCreated": "2026-10-08T09:00:00+02:00", "text": "Looks good.\nSecond line.", "author": {"@id": "person://renee?hash_algo=sha256"}},
+        {"@id": "pv://meta", "@type": "PropertyValue", "propertyID": "elabftw_metadata",
+         "value": json.dumps({"extra_fields": {"Temperature": {"type": "number", "value": "37", "unit": "°C"}}})},
+        {"@id": "howtostep://1", "@type": "HowToStep", "position": 1, "creativeWorkStatus": "finished", "itemListElement": {"@id": "howtodirection://1"}},
+        {"@id": "howtodirection://1", "@type": "HowToDirection", "text": "Prepare samples"},
+        {"@id": "#group-1", "@type": "Collection", "name": "Raw data", "hasPart": [{"@id": "./e1/f3"}]},
+    ]
+    def dataset(key, author, name, genre, url, text, **extra):
+        parts = [{"@id": file_id} for file_id in files if file_id.startswith(f"./{key}/")]
+        node = {"@id": f"./{key}/", "@type": "Dataset", "author": {"@id": author}, "name": name, "genre": genre,
+                "url": "https://eln.invalid/" + url, "text": text, "dateCreated": "2026-10-08T07:00:00+02:00",
+                "dateModified": "2026-10-08T08:00:00+02:00", "temporal": "2026-10-08T00:00:00+02:00",
+                "encodingFormat": "text/html", "status": "Normal", "identifier": f"20261008-{key}"}
+        node.update(extra)
+        if parts:
+            node["hasPart"] = node.get("hasPart", []) + parts
+        graph.append(node)
+    dataset("e1", alice, "Attachment recovery", "experiment", "experiments.php?mode=view&id=1",
+            '<h2>Image</h2><img src="app/download.php?f=ab/abcdef01.png&storage=1">', about={"@id": "#category-Demo"},
+            creativeWorkStatus="Running", keywords="demo,eln", comment=[{"@id": "comment://1"}],
+            variableMeasured=[{"@id": "pv://meta"}], step=[{"@id": "howtostep://1"}], mentions=[{"@id": "./r1/"}])
+    graph[-1]["hasPart"] = [part for part in graph[-1]["hasPart"] if part["@id"] != "./e1/f3"] + [{"@id": "#group-1"}]
+    dataset("e2", "person://renee?hash_algo=sha256", "Archived Markdown experiment", "experiment",
+            "experiments.php?mode=view&id=2", "## Results\n\n**Yield:** 81%.", encodingFormat="text/markdown", status="Archived")
+    dataset("r1", "person://renee?hash_algo=sha256", "Shared instrument", "resource", "database.php?mode=view&id=1", "<p>Resource.</p>")
+    dataset("t1", "person://renee?hash_algo=sha256", "PCR template", "experiment template", "templates.php?mode=view&id=1", "<p>Template.</p>")
+    dataset("d1", alice, "Deleted experiment", "experiment", "experiments.php?mode=view&id=3", "<p>Soft-deleted.</p>", status="Deleted")
+    dataset("e3", "person://alice2?hash_algo=sha256", "Same name, other person", "experiment", "experiments.php?mode=view&id=4", "<p>Homonym.</p>")
+    for file_id, (name, long_name, data, state, comment) in files.items():
+        node = {"@id": file_id, "@type": "File", "name": name, "alternateName": long_name, "creativeWorkStatus": state,
+                "contentSize": str(len(data or b"")), "sha256": hashlib.sha256(data or b"").hexdigest()}
+        if comment:
+            node["description"] = comment
+        graph.append(node)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{root}/ro-crate-metadata.json", json.dumps({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": graph}))
+        archive.writestr(f"{root}/ro-crate-preview.html", "<p>preview</p>")
+        for file_id, (_, _, data, _, _) in files.items():
+            if data is not None:
+                archive.writestr(f"{root}/{file_id[2:]}", data)
+        archive.writestr(f"{root}/orphan/stray.bin", b"Not referenced by any entry.\n")
+        for name, data in extra_members:
+            archive.writestr(f"{root}/{name}", data)
+    return Path(path)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
@@ -105,3 +176,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     for path in make_fixture(args.output, args.with_missing):
         print(path)
+    print(make_eln(args.output / "demo.eln", with_missing=args.with_missing))

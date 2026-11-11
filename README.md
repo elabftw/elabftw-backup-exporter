@@ -1,7 +1,7 @@
 # eLabFTW backup exporter
 
-Turn a MySQL dump and uploads backup into folders that can be read without an
-eLabFTW instance. The priority is recovering every attachment under its original
+Turn a MySQL dump and uploads backup, or an eLabFTW `.eln` export, into folders
+that can be read without an eLabFTW instance. The priority is recovering every attachment under its original
 `real_name`, next to its experiment or resource. Each entity also gets a readable
 PDF, a standalone HTML page, and JSON containing its original body and metadata.
 
@@ -15,6 +15,13 @@ Unzip this package, enter its directory, and run:
 
 ```bash
 bash run.sh --sql /path/to/backup.sql.gz --uploads /path/to/uploads.tar.gz --output /path/to/exported
+```
+
+To convert a `.eln` file exported from eLabFTW instead (one entry or a full export
+with many entries), no database or uploads archive is needed:
+
+```bash
+bash run.sh --eln /path/to/export.eln --output /path/to/exported
 ```
 
 The output directory must be new or empty. The first run downloads/builds images.
@@ -48,6 +55,26 @@ bash run.sh --sql backup.sql.gz --uploads /path/to/extracted/uploads --output ex
 - `_unlinked_attachments/`: files whose parent is missing, whose type is unknown,
   or whose template was not selected. Each folder includes `attachments.jsonl`.
 
+### From a `.eln` export
+
+The same layout is produced, with these differences:
+
+- Author folders are `user-<name>/` (a `.eln` holds no user IDs). Two different
+  people with the same name get `user-<name>/` and `user-<name>-2/`.
+- Entry folders are `experiment-<id>-<title>/`, `resource-<id>-<title>/`, or
+  `template-<id>-<title>/` (under `experiment-templates/` or `resource-templates/`).
+  The ID is the original eLabFTW ID, read from the entry's URL in the archive.
+- Each folder holds `record.pdf`, `record.html`, `record.json`, and the attached files
+  under their original names (`real_name`), including files in upload groups.
+  `record.json` also keeps the raw RO-Crate dataset node.
+- The HTML/PDF also show the category, status, comments, and links to the other
+  exported entries.
+- Each file's recorded sha256 and size are checked; differences are reported as
+  warnings in `problems.csv` and the file is still kept.
+- Archive files that no exported entry references go to `_unlinked_attachments/`.
+- Only `.eln` files produced by eLabFTW are supported, from 4.9 onwards: both the
+  older named-folder layout and the current UUID layout. Other ELN software is refused.
+
 Experiments and resources go under their stored owner's user ID, including shared
 resources. An absent owner gets an `Unknown user` folder. Users with no records
 still get a folder with `user.json`. Uploads are matched by **both entity type and
@@ -72,10 +99,11 @@ bash run.sh --help
 
 | Option | Effect |
 | --- | --- |
+| `--eln export.eln` | Convert an eLabFTW `.eln` export instead of `--sql`/`--uploads`. |
 | `--mysql-image mysql:8.0` | Use MySQL 8.0 instead of the default 8.4 for an older dump. |
 | `--database original_name` | Select the database explicitly if a dump contains multiple databases. |
 | `--exclude-deleted` | Skip soft-deleted entities and uploads (`state = 3`). Archived records/files remain. |
-| `--include-templates` | Also export experiment and resource templates that have a body. |
+| `--include-templates` | Also export experiment and resource templates that have a body (database mode; templates in a `.eln` are always exported). |
 | `--no-pdf` | Recover files and produce HTML/JSON without spending time rendering PDFs. |
 | `--pdf-timeout 180` | Allow 180 seconds per PDF instead of 90. |
 
@@ -131,7 +159,13 @@ a template, an inline image, duplicate names, a flat upload, and an unknown owne
 bash run.sh --sql demo/demo.sql.gz --uploads demo/demo-uploads.tar.gz --output demo-export
 ```
 
-To generate another fake backup, including a missing-file case:
+The same synthetic content is also available as an eLabFTW `.eln` export:
+
+```bash
+bash run.sh --eln demo/demo.eln --output demo-eln-export
+```
+
+To generate another fake backup and `.eln`, including a missing-file case:
 
 ```bash
 python3 tests/make_demo.py /tmp/demo-backup --with-missing
@@ -142,7 +176,7 @@ Developer tests (Python 3.12):
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt pypdf
-.venv/bin/python -m unittest tests.test_export tests.test_runner -v
+.venv/bin/python -m unittest tests.test_export tests.test_eln tests.test_runner -v
 # Against a disposable MySQL server only; creates/drops uniquely named test DBs:
 ELAB_TEST_MYSQL=1 DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=root DB_PASSWORD=example .venv/bin/python -m unittest tests.test_mysql -v
 ```
@@ -151,6 +185,12 @@ The Python exporter can also query an already-restored database directly:
 
 ```bash
 DB_HOST=127.0.0.1 DB_USER=root DB_PASSWORD=example .venv/bin/python export.py --database elabftw --uploads uploads.tar.gz --output exported
+```
+
+or convert a `.eln` file directly, without Docker:
+
+```bash
+.venv/bin/python export.py --eln export.eln --output exported
 ```
 
 Direct PDF rendering needs Pango and fonts on the host; the Dockerfile installs

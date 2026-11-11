@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Recover readable records and original attachment names from restored eLabFTW DBs."""
+"""Recover readable records and original attachment names from restored eLabFTW DBs or .eln exports."""
 from __future__ import annotations
 
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import html
 import json
 import logging
@@ -19,6 +20,7 @@ import sys
 import tarfile
 import tempfile
 from urllib.parse import parse_qs, quote, unquote, urlsplit
+import zipfile
 
 import markdown
 import pymysql
@@ -65,15 +67,15 @@ def safe_name(value, fallback="unnamed", max_bytes=180):
     return name
 
 
-def attachment_name(real_name, upload_id, used):
-    name = safe_name(real_name, f"upload-{upload_id}")
+def attachment_name(real_name, upload_id, used, label="upload"):
+    name = safe_name(real_name, f"{label}-{upload_id}")
     original = name
     number = 0
     while name.casefold() in used:
         number += 1
         suffix = Path(original).suffix
         stem = original[:-len(suffix)] if suffix else original
-        extra = f"__upload-{upload_id}" + (f"-{number}" if number > 1 else "")
+        extra = f"__{label}-{upload_id}" + (f"-{number}" if number > 1 else "")
         name = stem + extra + suffix
     used.add(name.casefold())
     return name
@@ -351,7 +353,8 @@ def make_record_html(entity, owner, attachments):
     state = {1: "Normal", 2: "Archived", 3: "Deleted"}.get(as_int(entity.get("state"), 1), str(entity.get("state")))
     details = [("Owner", owner_name), ("ID", entity["id"]), ("Date", entity.get("date")),
                ("Created", entity.get("created_at")), ("Modified", entity.get("modified_at", entity.get("lastchange"))),
-               ("Team", entity.get("team")), ("eLabID", entity.get("elabid")), ("State", state)]
+               ("Team", entity.get("team")), ("eLabID", entity.get("elabid")), ("Custom ID", entity.get("custom_id")),
+               ("Category", entity.get("category_title")), ("Status", entity.get("status_title")), ("State", state)]
     info = "<br>".join(f"<strong>{html.escape(label)}:</strong> {html.escape(str(value))}" for label, value in details if value is not None)
     if entity.get("tags"):
         info += "<br><strong>Tags:</strong> " + html.escape(", ".join(entity["tags"]))
@@ -386,6 +389,20 @@ def make_record_html(entity, owner, attachments):
                 body += '<span class="muted">Deadline: ' + html.escape(str(step["deadline"])) + "</span>"
             body += "</li>"
         body += "</ol>"
+    if entity.get("links"):
+        # Only .eln exports provide links; targets are other exported record folders.
+        body += "<h2>Linked entries</h2><ul>"
+        for link in entity["links"]:
+            label = html.escape(str(link.get("title") or "Untitled"))
+            body += f'<li><a href="{quote(link["href"], safe="/")}">{label}</a></li>' if link.get("href") else f"<li>{label}</li>"
+        body += "</ul>"
+    if entity.get("comments"):
+        body += "<h2>Comments</h2><ul>"
+        for comment in entity["comments"]:
+            body += (f'<li><strong>{html.escape(str(comment.get("author") or "Unknown"))}</strong>'
+                     f' <span class="muted">{html.escape(str(comment.get("date") or ""))}</span><br>'
+                     + html.escape(str(comment.get("text") or "")).replace("\n", "<br>") + "</li>")
+        body += "</ul>"
     if attachments:
         body += "<h2>Attached files</h2><ul>"
         for attachment in attachments:
@@ -585,6 +602,367 @@ def run_export(repo, store, report, args):
             report.summary["unlinked_attachments"] += len(recovered)
 
 
+# --- eLabFTW .eln (RO-Crate) input -------------------------------------------
+# Only archives produced by eLabFTW are supported. Their layout changed over
+# time: folders named "<category> - <title> - <hash>/" with files under their
+# real_name (before 5.2), then UUID folders and UUID file names. The JSON-LD
+# graph in ro-crate-metadata.json is authoritative, so archive paths are never
+# trusted for output names.
+ELN_GENRES = {"experiment": "experiments", "experiments": "experiments",
+              "experiment template": "experiments_templates", "template": "experiments_templates",
+              "protocol": "experiments_templates", "protocols": "experiments_templates",
+              "resource template": "items_types"}
+ELN_PAGES = (("resources-templates.php", "items_types"), ("templates.php", "experiments_templates"),
+             ("ucp.php", "experiments_templates"), ("experiments.php", "experiments"), ("database.php", "items"))
+ELN_STATES = {"normal": 1, "archived": 2, "deleted": 3}
+ELN_CRATE_FILES = {"ro-crate-metadata.json", "ro-crate-preview.html"}
+
+
+def as_list(value):
+    if value is None or value == "":
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def text_value(value):
+    if value is None or isinstance(value, (dict, list)):
+        return ""
+    return str(value)
+
+
+class ElnArchive:
+    """Index an eLabFTW .eln archive. Members are streamed; none are extracted by their own path."""
+    def __init__(self, path):
+        try:
+            self.zip = zipfile.ZipFile(path)
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise ValueError(f"Cannot read the .eln archive: {exc}") from exc
+        self.members, self.used, metadata = {}, set(), []
+        for info in self.zip.infolist():
+            if info.is_dir():
+                continue
+            name = self.normalize(info.filename)
+            self.members.setdefault(name, info)
+            parts = name.split("/")
+            if len(parts) == 2 and parts[1] == "ro-crate-metadata.json":
+                metadata.append((parts[0], info))
+        if len(metadata) != 1:
+            raise ValueError("The .eln archive must contain exactly one <folder>/ro-crate-metadata.json")
+        self.root, info = metadata[0]
+        try:
+            with self.zip.open(info) as handle:
+                data = json.load(handle)
+        except (ValueError, OSError, zipfile.BadZipFile) as exc:
+            raise ValueError(f"Cannot parse ro-crate-metadata.json: {exc}") from exc
+        graph = data.get("@graph") if isinstance(data, dict) else None
+        if not isinstance(graph, list):
+            raise ValueError("ro-crate-metadata.json has no @graph list")
+        # Old exports may repeat an @id (e.g. two comments made in the same second): keep all.
+        self.nodes = {}
+        for node in graph:
+            if isinstance(node, dict) and isinstance(node.get("@id"), str):
+                self.nodes.setdefault(node["@id"], []).append(node)
+        self.crate = self.resolve("./")
+        publisher = self.resolve(self.resolve("ro-crate-metadata.json").get("sdPublisher"))
+        if publisher.get("name") != "eLabFTW":
+            raise ValueError("This .eln archive was not exported by eLabFTW; only eLabFTW .eln exports are supported")
+        # The internal version exists since 5.1; earlier exports used "status" for the status title.
+        self.version = as_int(self.crate.get("version"), None) if "version" in self.crate else None
+        # eLabFTW < 5.0.0-beta2 stored some HTML-escaped text: undo it like eLabFTW's importer does.
+        self.legacy_escaping = "areaServed" not in publisher
+
+    @staticmethod
+    def normalize(name):
+        return re.sub(r"/{2,}", "/", str(name).replace("\\", "/")).removeprefix("./").lstrip("/")
+
+    def resolve(self, ref, occurrence=0):
+        """Return the node for an {"@id": ...} reference, an @id string, or an inline node."""
+        if isinstance(ref, str):
+            ref = {"@id": ref}
+        if not isinstance(ref, dict):
+            return {}
+        if set(ref) != {"@id"}:
+            return ref
+        candidates = self.nodes.get(ref["@id"]) or [{}]
+        return candidates[min(occurrence, len(candidates) - 1)]
+
+    def fix(self, value, comment=False):
+        value = text_value(value)
+        if self.legacy_escaping:
+            value = value.replace("&#34;", '"').replace("&#39;", "'")
+            if comment:
+                value = value.replace("<br />", "")
+        return value
+
+    def member(self, file_id):
+        """Find the archive member of a File node; old importers also replaced : | and "."""
+        relative = self.normalize(file_id)
+        candidates = []
+        for variant in (relative, unquote(relative)):
+            candidates += [variant, re.sub(r'[:|"]', "_", variant)]
+        # Lookup only: member names are never used as output paths.
+        for candidate in candidates:
+            info = self.members.get(self.normalize(f"{self.root}/{candidate}"))
+            if info:
+                return info
+        return None
+
+    def close(self):
+        self.zip.close()
+
+
+def person_name(person):
+    name = " ".join(text_value(person.get(key)) for key in ("givenName", "familyName")).strip()
+    return name or text_value(person.get("name")).strip()
+
+
+def eln_entity_type(node):
+    genre = text_value(node.get("genre")).strip().lower()
+    if genre:
+        return ELN_GENRES.get(genre, "items")
+    path = urlsplit(text_value(node.get("url"))).path
+    for page_name, table in ELN_PAGES:
+        if page_name in path:
+            return table
+    return "items"
+
+
+def eln_entity(archive, node):
+    """Map a Dataset node to the entity fields used by the HTML/PDF renderer."""
+    fix = archive.fix
+    url = text_value(node.get("url"))
+    match = re.search(r"[?&](?:id|templateid)=(\d+)", url)
+    status = text_value(node.get("status"))
+    if archive.version is not None:
+        state, status_title = ELN_STATES.get(status.lower(), 1), node.get("creativeWorkStatus")
+    else:
+        state, status_title = 1, status or node.get("creativeWorkStatus")
+    category = archive.resolve(node.get("about")).get("name") if node.get("about") else node.get("category")
+    keywords = node.get("keywords")
+    tags = keywords.split(",") if isinstance(keywords, str) else as_list(keywords)
+    rating = node.get("aggregateRating")
+    custom_id = node.get("alternateName")
+    date = text_value(node.get("temporal") or node.get("dateCreated"))[:10] or None
+    metadata, fallback_fields = None, {}
+    for ref in as_list(node.get("variableMeasured")):
+        prop = archive.resolve(ref)
+        if prop.get("propertyID") == "elabftw_metadata":
+            metadata = text_value(prop.get("value"))
+        elif prop.get("propertyID"):
+            value = prop.get("value")
+            if isinstance(value, (dict, list)):
+                value = [archive.resolve(item).get("name", item) for item in as_list(value)]
+            fallback_fields[text_value(prop["propertyID"])] = {"value": value, "unit": prop.get("unitText")}
+    if metadata is None and fallback_fields:
+        metadata = json.dumps({"extra_fields": fallback_fields}, ensure_ascii=False)
+    steps = []
+    for ref in as_list(node.get("step")):
+        step = archive.resolve(ref)
+        direction = step.get("itemListElement")
+        direction = archive.resolve(direction[0] if isinstance(direction, list) and direction else direction)
+        steps.append({"body": text_value(direction.get("text")), "ordering": step.get("position"),
+                      "finished": 1 if step.get("creativeWorkStatus") == "finished" else 0,
+                      "finished_time": step.get("temporal"), "deadline": step.get("expires")})
+    comments, seen = [], {}
+    for ref in as_list(node.get("comment")):
+        key = ref.get("@id") if isinstance(ref, dict) else ref
+        comment = archive.resolve(ref, seen.get(key, 0))
+        seen[key] = seen.get(key, 0) + 1
+        comments.append({"author": fix(person_name(archive.resolve(comment.get("author")))) or "Unknown",
+                         "date": comment.get("dateCreated"), "text": fix(comment.get("text"), comment=True)})
+    return {
+        "id": int(match[1]) if match else None, "entity_type": eln_entity_type(node),
+        "title": fix(node.get("name")).strip() or "Untitled", "date": date,
+        "created_at": node.get("dateCreated"), "modified_at": node.get("dateModified"),
+        "elabid": node.get("identifier"), "custom_id": custom_id if custom_id not in (None, "") else None,
+        "category_title": fix(category) or None, "status_title": fix(status_title) or None,
+        "content_type": 2 if node.get("encodingFormat") == "text/markdown" else 1,
+        "body": text_value(node.get("text")) or text_value(node.get("description")),
+        "state": state, "locked": 1 if node.get("conditionsOfAccess") == "Locked" else 0,
+        "rating": rating.get("ratingValue") if isinstance(rating, dict) else None,
+        "metadata": metadata, "tags": [fix(tag).strip() for tag in tags if text_value(tag).strip()],
+        "steps": steps, "comments": comments, "url": url or None,
+    }
+
+
+def eln_files(archive, node):
+    """File nodes of a dataset, including those only listed in an upload group (Collection)."""
+    files, seen = [], set()
+    for ref in as_list(node.get("hasPart")):
+        part = archive.resolve(ref)
+        members = [part] if part.get("@type") == "File" else [
+            archive.resolve(item) for item in as_list(part.get("hasPart"))] if part.get("@type") == "Collection" else []
+        for item in members:
+            file_id = item.get("@id")
+            if item.get("@type") == "File" and isinstance(file_id, str) and file_id not in seen:
+                seen.add(file_id)
+                files.append(item)
+    return files
+
+
+def copy_eln_files(archive, files, folder, report, entity_type, entity_id, exclude_deleted=False):
+    """Copy archive members under their original names, verifying the recorded sha256 and size."""
+    used = RESERVED | {path.name.casefold() for path in folder.iterdir()}
+    recovered = []
+    for number, file in enumerate(files, 1):
+        file_id = file["@id"]
+        state = ELN_STATES.get(text_value(file.get("creativeWorkStatus")).lower(), 1)
+        info = file.get("_member") or (None if file_id.startswith(("http://", "https://")) else archive.member(file_id))
+        if info:
+            archive.used.add(info.filename)
+        if exclude_deleted and state == 3:
+            report.summary["attachments_excluded"] += 1
+            continue
+        upload = {"id": None, "real_name": text_value(file.get("name")) or PurePosixPath(file_id).name,
+                  "long_name": text_value(file.get("alternateName")) or None,
+                  "comment": archive.fix(file.get("description"), comment=True) or None, "state": state,
+                  "filesize": file.get("contentSize"), "hash": file.get("sha256"), "hash_algorithm": "sha256",
+                  "eln_path": file_id, "exported_name": None}
+        detail, status = "", "missing"
+        if not info:
+            detail = "Remote file; not part of the archive" if file_id.startswith(("http://", "https://")) else "File is absent from the .eln archive"
+        else:
+            name = attachment_name(upload["real_name"], number, used, label="file")
+            destination, digest, size = folder / name, hashlib.sha256(), 0
+            try:
+                with archive.zip.open(info) as source, destination.open("wb") as target:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+                        size += len(chunk)
+                        target.write(chunk)
+                upload["exported_name"], status = name, "copied"
+                upload["source_archive_path"] = info.filename
+                report.summary["attachments_copied"] += 1
+            except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+                destination.unlink(missing_ok=True)
+                detail, status = str(exc), "copy_error"
+            if status == "copied":
+                expected_hash = text_value(upload["hash"]).lower()
+                if re.fullmatch(r"[0-9a-f]{64}", expected_hash) and expected_hash != digest.hexdigest():
+                    report.problem("warning", "attachment_hash_mismatch", entity_type=entity_type, entity_id=entity_id,
+                                   path=info.filename, detail=f"Recorded sha256: {expected_hash}; archive file: {digest.hexdigest()}")
+                if upload["filesize"] not in (None, "") and as_int(upload["filesize"], -1) != size:
+                    report.problem("warning", "attachment_size_mismatch", entity_type=entity_type, entity_id=entity_id,
+                                   path=info.filename, detail=f"Recorded size: {upload['filesize']}; archive size: {size}")
+        if status != "copied":
+            upload["recovery_error"] = detail
+            report.summary["attachments_missing"] += 1
+            report.problem("error", status + "_attachment", entity_type=entity_type, entity_id=entity_id, path=file_id, detail=detail)
+        relative = (folder / upload["exported_name"]).relative_to(report.output).as_posix() if upload["exported_name"] else ""
+        report.attachments.writerow(dict(entity_type=entity_type, entity_id=entity_id, real_name=upload["real_name"],
+                                         long_name=upload["long_name"], state=state, exported_path=relative,
+                                         status=status, detail=detail))
+        recovered.append(upload)
+    return recovered
+
+
+def run_eln_export(archive, report, args):
+    folders_by_person, used_folder_names = {}, set()
+
+    def owner_folder(person):
+        key = person.get("@id") or json.dumps(person, sort_keys=True, default=str)
+        if key not in folders_by_person:
+            name = archive.fix(person_name(person)) or "Unknown user"
+            base = f"user-{safe_name(name, 'Unknown user', 100)}"
+            folder_name, number = base, 1
+            while folder_name.casefold() in used_folder_names:
+                number += 1
+                folder_name = f"{base}-{number}"
+            used_folder_names.add(folder_name.casefold())
+            folder = report.output / folder_name
+            folder.mkdir()
+            write_json(folder / "user.json", person or {"name": name})
+            first, last = archive.fix(person.get("givenName")), archive.fix(person.get("familyName"))
+            owner = {"firstname": first if first or last else name, "lastname": last,
+                     "email": person.get("email"), "orcid": person.get("identifier"), "eln_id": person.get("@id")}
+            folders_by_person[key] = (folder, owner)
+        return folders_by_person[key]
+
+    # Exported entries are listed in the root dataset; also accept stray eLabFTW datasets.
+    ids = [ref.get("@id") if isinstance(ref, dict) else ref for ref in as_list(archive.crate.get("hasPart"))]
+    ids += [node_id for node_id, nodes in archive.nodes.items() if node_id.startswith("./") and node_id != "./"
+            and any(node.get("@type") == "Dataset" and (node.get("author") or node.get("genre")) for node in nodes)]
+    plan, planned_ids, used_entity_folders = [], set(), set()
+    for node_id in ids:
+        node = archive.resolve(node_id)
+        if not isinstance(node_id, str) or node_id in planned_ids or node.get("@type") != "Dataset":
+            continue
+        planned_ids.add(node_id)
+        entity = eln_entity(archive, node)
+        files = eln_files(archive, node)
+        if args.exclude_deleted and entity["state"] == 3:
+            for file in files:  # An excluded entry's files are not orphans.
+                info = archive.member(file["@id"])
+                if info:
+                    archive.used.add(info.filename)
+            report.summary["entities_excluded"] = report.summary.get("entities_excluded", 0) + 1
+            continue
+        person = archive.resolve(node.get("author")) if node.get("author") else {}
+        user_folder, owner = owner_folder(person)
+        table = entity["entity_type"]
+        prefix = {"experiments": "experiment", "items": "resource"}.get(table, "template")
+        base = f"{prefix}-{entity['id']}-" if entity["id"] is not None else f"{prefix}-"
+        base += safe_name(entity["title"], "Untitled", 100)
+        folder, number = user_folder / KINDS[table] / base, 1
+        while folder.as_posix().casefold() in used_entity_folders:
+            number += 1
+            folder = user_folder / KINDS[table] / f"{base}-{number}"
+        used_entity_folders.add(folder.as_posix().casefold())
+        plan.append((node, entity, files, owner, folder))
+    folders = {node["@id"]: (entity, folder) for node, entity, _, _, folder in plan}
+
+    print(f"Exporting {len(plan):,} entries from the .eln archive...", flush=True)
+    for node, entity, files, owner, folder in plan:
+        table, entity_id = entity["entity_type"], entity["id"]
+        report.summary["entities"].setdefault(table, 0)
+        folder.mkdir(parents=True)
+        entity["links"] = []
+        for ref in as_list(node.get("mentions")):
+            target_id = ref.get("@id") if isinstance(ref, dict) else ref
+            if target_id in folders:
+                target, target_folder = folders[target_id]
+                entity["links"].append({"title": target["title"], "href": os.path.relpath(target_folder / "record.html", folder)})
+            else:
+                entity["links"].append({"title": archive.fix(archive.resolve(ref).get("name")).strip() or target_id})
+        attachments = copy_eln_files(archive, files, folder, report, table, entity_id, args.exclude_deleted)
+        write_json(folder / "record.json", {"entity": entity, "owner": owner, "attachments": attachments, "eln_dataset": node})
+        try:
+            (folder / "record.html").write_text(make_record_html(entity, owner, attachments), encoding="utf-8")
+            has_pdf = False if args.no_pdf else render_record(folder, args.pdf_timeout, report, entity)
+            report.add_record(entity, owner, folder, attachments, has_pdf)
+        except Exception as exc:
+            report.problem("error", "record_render_failed", entity_type=table, entity_id=entity_id, detail=str(exc))
+        report.summary["entities"][table] += 1
+    print(f"  {len(plan):,} records recovered", flush=True)
+
+    # Keep any archive file not referenced by an exported entry.
+    print("Recovering unlinked attachments...", flush=True)
+    file_nodes = {}
+    for nodes in archive.nodes.values():
+        for node in nodes:
+            if node.get("@type") == "File":
+                info = archive.member(node["@id"])
+                if info:
+                    file_nodes.setdefault(info.filename, node)
+    groups, crate_files = {}, {f"{archive.root}/{name}" for name in ELN_CRATE_FILES}
+    for info in archive.zip.infolist():
+        name = archive.normalize(info.filename)
+        if info.is_dir() or info.filename in archive.used or name in crate_files:
+            continue
+        archive.used.add(info.filename)
+        relative = name.removeprefix(archive.root + "/")
+        node = dict(file_nodes.get(info.filename) or {"@id": relative, "name": PurePosixPath(relative).name}, _member=info)
+        groups.setdefault(PurePosixPath(relative).parent.name or "crate-root", []).append(node)
+    for group, files in groups.items():
+        folder = report.output / "_unlinked_attachments" / f"eln-{safe_name(group, 'files', 100)}"
+        folder.mkdir(parents=True, exist_ok=True)
+        recovered = copy_eln_files(archive, files, folder, report, "unlinked", None)
+        with (folder / "attachments.jsonl").open("a", encoding="utf-8") as handle:
+            for row in recovered:
+                handle.write(json.dumps(row, ensure_ascii=False, default=json_default) + "\n")
+        report.summary["unlinked_attachments"] += len(recovered)
+
+
 def positive_int(value):
     number = int(value)
     if number <= 0:
@@ -594,7 +972,8 @@ def positive_int(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--uploads", type=Path, required=True, help="Uploads tar archive or extracted directory")
+    parser.add_argument("--uploads", type=Path, help="Uploads tar archive or extracted directory (database mode)")
+    parser.add_argument("--eln", type=Path, help="eLabFTW .eln export to convert instead of a database and uploads")
     parser.add_argument("--output", type=Path, required=True, help="Empty export directory")
     parser.add_argument("--database", default=os.environ.get("DB_DATABASE") or None)
     parser.add_argument("--host", default=os.environ.get("DB_HOST", "127.0.0.1"))
@@ -604,7 +983,49 @@ def parse_args(argv=None):
     parser.add_argument("--include-templates", action="store_true")
     parser.add_argument("--no-pdf", action="store_true")
     parser.add_argument("--pdf-timeout", type=positive_int, default=90)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if bool(args.eln) == bool(args.uploads):
+        parser.error("provide either --uploads (with a database) or --eln")
+    return args
+
+
+def prepare_output(output):
+    output.mkdir(parents=True, exist_ok=True)
+    if any(output.iterdir()):
+        raise ValueError("Output directory must be empty; existing files are never overwritten")
+
+
+def finish_report(report):
+    report.finish()
+    print(f"Recovered {sum(report.summary['entities'].values()):,} records, "
+          f"{report.summary['attachments_copied']:,} attachments, and {report.summary['pdfs']:,} PDFs.", flush=True)
+    if report.summary["errors"]:
+        print(f"{report.summary['errors']} error(s); see problems.csv and export-report.json.", file=sys.stderr)
+        return 2
+    return 0
+
+
+def main_eln(args):
+    report, archive = None, None
+    try:
+        if not args.eln.is_file():
+            raise ValueError(f".eln file not found: {args.eln}")
+        archive = ElnArchive(args.eln)
+        prepare_output(args.output)
+        print(f"Using .eln archive: {args.eln.name}", flush=True)
+        report = Report(args.output, None, {"source": "eln", "exclude_deleted": args.exclude_deleted, "pdf": not args.no_pdf})
+        report.summary["eln"] = {"file": args.eln.name, "root": archive.root, "version": archive.version}
+        run_eln_export(archive, report, args)
+        return finish_report(report)
+    except Exception as exc:
+        logging.error("Export failed: %s", exc)
+        if report and not report.index_html.closed:
+            report.problem("error", "fatal", detail=str(exc))
+            report.finish(incomplete=True)
+        return 1
+    finally:
+        if archive:
+            archive.close()
 
 
 def main(argv=None):
@@ -612,14 +1033,14 @@ def main(argv=None):
     args.output = args.output.resolve()
     report, connection = None, None
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+    if args.eln:
+        return main_eln(args)
     try:
         if not args.uploads.exists():
             raise ValueError(f"Uploads backup not found: {args.uploads}")
         if args.uploads.is_dir() and args.output.is_relative_to(args.uploads.resolve()):
             raise ValueError("Output directory must be outside the uploaded-files source directory")
-        args.output.mkdir(parents=True, exist_ok=True)
-        if any(args.output.iterdir()):
-            raise ValueError("Output directory must be empty; existing files are never overwritten")
+        prepare_output(args.output)
         connection = pymysql.connect(host=args.host, port=args.port, user=args.user,
                                      password=os.environ.get("DB_PASSWORD", ""), charset="utf8mb4",
                                      cursorclass=pymysql.cursors.DictCursor, autocommit=True,
@@ -637,13 +1058,7 @@ def main(argv=None):
                 run_export(repo, store, report, args)
             finally:
                 store.close()
-        report.finish()
-        print(f"Recovered {sum(report.summary['entities'].values()):,} records, "
-              f"{report.summary['attachments_copied']:,} attachments, and {report.summary['pdfs']:,} PDFs.", flush=True)
-        if report.summary["errors"]:
-            print(f"{report.summary['errors']} error(s); see problems.csv and export-report.json.", file=sys.stderr)
-            return 2
-        return 0
+        return finish_report(report)
     except Exception as exc:
         logging.error("Export failed: %s", exc)
         if report and not report.index_html.closed:
